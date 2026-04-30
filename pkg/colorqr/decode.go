@@ -52,25 +52,45 @@ func Decode(r io.Reader, opts *DecodeOptions) ([]byte, error) {
 	// (We derive bpc from palette length above; format strip could carry
 	// additional metadata in a full implementation.)
 
-	// ── 4. build layout & extract data bits ──────────────────────────────
+	// ── 4. build layout & extract data bits + per-cell confidence ────────
 	l := newLayout(side)
 	coords := l.dataCoords()
 
 	var bits []bool
+	// cellDist[i] = squared YUV distance for cell i (lower = more confident).
+	cellDist := make([]float64, 0, len(coords))
 	for _, pos := range coords {
 		cx := innerOriginX + (pos[1])*cellPx + cellPx/2
 		cy := innerOriginY + (pos[0])*cellPx + cellPx/2
 		sampled := sampleCell(img, cx, cy, cellPx)
-		idx := nearestColor(sampled, palette)
+		idx, dist := nearestColorDist(sampled, palette)
+		cellDist = append(cellDist, dist)
 		for b := bpc - 1; b >= 0; b-- {
 			bits = append(bits, (idx>>b)&1 == 1)
 		}
 	}
 
-	// ── 5. bits → bytes ───────────────────────────────────────────────────
-	byteData := bitsToBytes(bits)
+	// ── 5. bits → bytes, compute per-byte confidence ──────────────────────
+	rawBytes := bitsToBytes(bits)
+	cellsPerByte := 8 / bpc
+	byteConf := make([]float64, len(rawBytes))
+	for i := range rawBytes {
+		// Confidence for byte i = max cell distance across its contributing cells.
+		for k := 0; k < cellsPerByte; k++ {
+			ci := i*cellsPerByte + k
+			if ci < len(cellDist) && cellDist[ci] > byteConf[i] {
+				byteConf[i] = cellDist[ci]
+			}
+		}
+	}
 
-	// ── 6. strip length header ────────────────────────────────────────────
+	// ── 6. RS decode ──────────────────────────────────────────────────────
+	byteData, err := rsDecode(rawBytes, byteConf)
+	if err != nil {
+		return nil, fmt.Errorf("rs decode: %w", err)
+	}
+
+	// ── 7. strip length header ────────────────────────────────────────────
 	if len(byteData) < 4 {
 		return nil, fmt.Errorf("data region too short to contain length header")
 	}
@@ -206,13 +226,18 @@ func samplePaletteFromStrips(img image.Image, ox, oy, side, cellPx int) Palette 
 // nearestColor returns the index in palette that is closest to c in YUV space
 // (Euclidean distance), matching the minimum-distance classifier from the paper.
 func nearestColor(c color.RGBA, palette Palette) int {
+	idx, _ := nearestColorDist(c, palette)
+	return idx
+}
+
+// nearestColorDist returns the palette index and squared YUV distance.
+func nearestColorDist(c color.RGBA, palette Palette) (int, float64) {
 	cv := rgbaToYUV(c)
 	refs := make([]yuv, len(palette))
 	for i, p := range palette {
 		refs[i] = rgbaToYUV(p)
 	}
-	idx, _ := nearestYUV(cv, refs)
-	return idx
+	return nearestYUV(cv, refs)
 }
 
 func nearestYUV(c yuv, refs []yuv) (int, float64) {

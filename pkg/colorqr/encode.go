@@ -51,8 +51,12 @@ func Encode(w io.Writer, data []byte, opts *EncodeOptions) error {
 	binary.BigEndian.PutUint32(payload[:4], uint32(len(data)))
 	copy(payload[4:], data)
 
-	// Convert payload bytes → bit stream.
-	bits := bytesToBits(payload)
+	// Apply Reed-Solomon ECC, then convert to bit stream.
+	eccData, err := rsEncode(payload)
+	if err != nil {
+		return fmt.Errorf("rs encode: %w", err)
+	}
+	bits := bytesToBits(eccData)
 
 	side := minInnerSide(len(bits), bpc)
 	if side < 0 {
