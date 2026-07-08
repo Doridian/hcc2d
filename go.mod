@@ -6,5 +6,5 @@ require github.com/klauspost/reedsolomon v1.14.1
 
 require (
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 )
