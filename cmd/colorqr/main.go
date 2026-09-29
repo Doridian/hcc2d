@@ -1,16 +1,17 @@
-// colorqr is a command-line tool for encoding and decoding HCC2D-inspired
-// 2D color barcodes.
+// colorqr is a command-line tool for encoding and decoding HCC2D 2D color
+// barcodes.
 //
 // Usage:
 //
-//	colorqr encode -o out.png "Hello, world!"
-//	colorqr encode -o out.png -cell 20 < payload.bin
+//	colorqr encode -o out.png -colors 8 "Hello, world!"
+//	colorqr encode -o out.png -ec H < payload.bin
 //	colorqr decode out.png
 package main
 
 import (
 	"flag"
 	"fmt"
+	"image/png"
 	"io"
 	"os"
 
@@ -29,109 +30,133 @@ func run(args []string) error {
 		printUsage()
 		return nil
 	}
-
 	switch args[0] {
 	case "encode":
 		return encodeCmd(args[1:])
 	case "decode":
 		return decodeCmd(args[1:])
-	default:
+	case "-h", "-help", "--help", "help":
 		printUsage()
-		return fmt.Errorf("unknown command: %s", args[0])
+		return nil
 	}
+	printUsage()
+	return fmt.Errorf("unknown command: %s", args[0])
 }
 
 func encodeCmd(args []string) error {
 	fs := flag.NewFlagSet("encode", flag.ExitOnError)
-	outFile := fs.String("o", "out.png", "output PNG file path")
-	cellPx := fs.Int("cell", colorqr.DefaultCellPx, "pixels per cell")
+	outFile := fs.String("o", "out.png", "output PNG file")
+	colors := fs.Int("colors", 4, "number of colors: 4 (2 bits/module) or 8 (3 bits/module)")
+	ec := fs.String("ec", "L", "error correction level: L, M, Q or H")
+	version := fs.Int("version", 1, "minimum symbol version (1-40)")
+	modulePx := fs.Int("module", colorqr.DefaultModulePx, "pixels per module")
+	quiet := fs.Int("quiet", colorqr.DefaultQuietZone, "quiet zone in modules")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	level, err := colorqr.ParseECLevel(*ec)
+	if err != nil {
 		return err
 	}
 
 	var data []byte
 	if fs.NArg() > 0 {
-		// Data supplied as command-line argument.
 		data = []byte(fs.Arg(0))
-	} else {
-		// Read from stdin.
-		var err error
-		data, err = io.ReadAll(os.Stdin)
-		if err != nil {
-			return fmt.Errorf("read stdin: %w", err)
-		}
+	} else if data, err = io.ReadAll(os.Stdin); err != nil {
+		return fmt.Errorf("read stdin: %w", err)
 	}
 
+	opts := &colorqr.EncodeOptions{
+		Scheme:     colorqr.Scheme(*colors),
+		Level:      level,
+		MinVersion: *version,
+	}
+	sym, err := colorqr.NewSymbol(data, opts)
+	if err != nil {
+		return err
+	}
 	f, err := os.Create(*outFile)
 	if err != nil {
-		return fmt.Errorf("create %s: %w", *outFile, err)
+		return err
 	}
-	defer f.Close()
-
-	opts := &colorqr.EncodeOptions{CellPx: *cellPx}
-	if err := colorqr.Encode(f, data, opts); err != nil {
-		return fmt.Errorf("encode: %w", err)
+	if err := png.Encode(f, sym.Image(max(1, *modulePx), max(0, *quiet))); err != nil {
+		_ = f.Close()
+		return err
 	}
-	fmt.Printf("Encoded %d bytes → %s\n", len(data), *outFile)
+	if err := f.Close(); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "encoded %d bytes → %s (version %d, %d×%d modules, %s, EC %s, mask %d)\n",
+		len(data), *outFile, sym.Version, sym.Size(), sym.Size(), sym.Scheme, sym.Level, sym.Mask)
 	return nil
 }
 
 func decodeCmd(args []string) error {
 	fs := flag.NewFlagSet("decode", flag.ExitOnError)
 	outFile := fs.String("o", "", "write decoded bytes to file (default: stdout)")
+	classifier := fs.String("classifier", "kmeans", "color classifier: kmeans or euclidean")
+	verbose := fs.Bool("v", false, "print symbol information to stderr")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() == 0 {
-		return fmt.Errorf("decode: expected input file argument")
+	if fs.NArg() != 1 {
+		return fmt.Errorf("decode: expected one input image")
+	}
+	opts := &colorqr.DecodeOptions{}
+	switch *classifier {
+	case "kmeans":
+		opts.Classifier = colorqr.KMeans
+	case "euclidean":
+		opts.Classifier = colorqr.MinDistance
+	default:
+		return fmt.Errorf("unknown classifier %q", *classifier)
 	}
 
 	f, err := os.Open(fs.Arg(0))
 	if err != nil {
-		return fmt.Errorf("open %s: %w", fs.Arg(0), err)
+		return err
 	}
-	defer f.Close()
-
-	data, err := colorqr.Decode(f, nil)
+	res, err := colorqr.Decode(f, opts)
+	_ = f.Close()
 	if err != nil {
-		return fmt.Errorf("decode: %w", err)
+		return err
+	}
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "version %d, %s, EC %s, mask %d, %d bytes corrected\n",
+			res.Version, res.Scheme, res.Level, res.Mask, res.Corrected)
 	}
 
-	var w io.Writer
 	if *outFile == "" {
-		w = os.Stdout
-	} else {
-		out, err := os.Create(*outFile)
-		if err != nil {
-			return fmt.Errorf("create %s: %w", *outFile, err)
-		}
-		defer out.Close()
-		w = out
+		_, err = os.Stdout.Write(res.Data)
+		return err
 	}
-
-	_, err = w.Write(data)
-	return err
+	return os.WriteFile(*outFile, res.Data, 0o644)
 }
 
 func printUsage() {
-	fmt.Fprintln(os.Stderr, `colorqr – 2D color barcode encoder/decoder
+	fmt.Fprintln(os.Stderr, `colorqr – HCC2D 2D color barcode encoder/decoder
 
 Usage:
   colorqr encode [flags] [<text>]
-  colorqr decode [flags] <file.png>
+  colorqr decode [flags] <image>
 
 Encode flags:
-  -o <file>   Output PNG file (default: out.png)
-  -cell <n>   Pixels per cell (default: 10)
+  -o <file>        output PNG file (default out.png)
+  -colors <4|8>    color scheme: 4 colors = 2 bits/module, 8 colors = 3 bits/module
+  -ec <L|M|Q|H>    error correction level (default L)
+  -version <n>     minimum symbol version 1-40 (default 1)
+  -module <px>     pixels per module (default 8)
+  -quiet <n>       quiet zone in modules (default 4)
 
-  If <text> is omitted, payload is read from stdin.
+  If <text> is omitted, the payload is read from stdin.
 
 Decode flags:
-  -o <file>   Write decoded bytes to file (default: stdout)
+  -o <file>                   write decoded bytes to file (default stdout)
+  -classifier <kmeans|euclidean>  color classifier (default kmeans)
+  -v                          print symbol information
 
 Examples:
   colorqr encode -o hello.png "Hello, world!"
-  colorqr decode hello.png
-  echo "binary data" | colorqr encode -o data.png
-  colorqr decode -o recovered.bin data.png`)
+  colorqr encode -colors 8 -ec M -o data.png < file.bin
+  colorqr decode -v hello.png`)
 }

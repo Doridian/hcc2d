@@ -1,353 +1,603 @@
 package colorqr
 
 import (
-	"encoding/binary"
+	"errors"
 	"fmt"
 	"image"
-	"image/color"
-	_ "image/png"
+	_ "image/gif"  // register decoders for Decode
+	_ "image/jpeg" //
+	_ "image/png"  //
 	"io"
 	"math"
+	"sort"
 )
 
-// DecodeOptions controls decoding parameters.
+// Classifier selects how data modules are mapped to palette colors.
+type Classifier int
+
+const (
+	// KMeans clusters all data modules, seeding the centroids with the
+	// colors read from the palette patterns. The paper found it to have the
+	// lowest byte error rate of the classifiers it studied.
+	KMeans Classifier = iota
+	// MinDistance assigns each module to the nearest palette-pattern color
+	// (Euclidean distance in YUV), the paper's baseline classifier.
+	MinDistance
+)
+
+// DecodeOptions controls decoding.
 type DecodeOptions struct {
-	// Palette overrides the reference palette used for nearest-color
-	// classification.  When nil the decoder reads the palette from the
-	// embedded palette strips (k-means, simple version).
-	Palette Palette
+	Classifier Classifier
 }
 
-// Decode reads a colorqr PNG from r and returns the original payload bytes.
-//
-// The decoder assumes the image is perfectly aligned (no rotation, no
-// perspective distortion).  It locates the symbol by detecting the three
-// finder patterns and derives the cell grid from their positions.
-func Decode(r io.Reader, opts *DecodeOptions) ([]byte, error) {
+// Result is a decoded symbol.
+type Result struct {
+	Data      []byte
+	Version   int
+	Scheme    Scheme
+	Level     ECLevel
+	Mask      int
+	Corrected int // bytes fixed by Reed-Solomon
+}
+
+// Decode reads an image (PNG, JPEG or GIF) from r and decodes the symbol in
+// it.
+func Decode(r io.Reader, opts *DecodeOptions) (*Result, error) {
 	img, _, err := image.Decode(r)
 	if err != nil {
-		return nil, fmt.Errorf("decode image: %w", err)
+		return nil, fmt.Errorf("read image: %w", err)
 	}
-
-	// ── 1. locate finder patterns ─────────────────────────────────────────
-	cellPx, innerOriginX, innerOriginY, side, err := locateGrid(img)
-	if err != nil {
-		return nil, fmt.Errorf("locate grid: %w", err)
-	}
-
-	// ── 2. sample the palette from strips ────────────────────────────────
-	var palette Palette
-	if opts != nil && opts.Palette != nil {
-		palette = opts.Palette
-	} else {
-		palette = samplePaletteFromStrips(img, innerOriginX, innerOriginY, side, cellPx)
-	}
-
-	bpc := FourColor.bitsPerCell()
-	if len(palette) == int(EightColor) {
-		bpc = EightColor.bitsPerCell()
-	}
-
-	// ── 3. read format strip ──────────────────────────────────────────────
-	// (We derive bpc from palette length above; format strip could carry
-	// additional metadata in a full implementation.)
-
-	// ── 4. build layout & extract data bits + per-cell confidence ────────
-	l := newLayout(side)
-	coords := l.dataCoords()
-
-	var bits []bool
-	// cellDist[i] = squared YUV distance for cell i (lower = more confident).
-	cellDist := make([]float64, 0, len(coords))
-	for _, pos := range coords {
-		cx := innerOriginX + (pos[1])*cellPx + cellPx/2
-		cy := innerOriginY + (pos[0])*cellPx + cellPx/2
-		sampled := sampleCell(img, cx, cy, cellPx)
-		idx, dist := nearestColorDist(sampled, palette)
-		cellDist = append(cellDist, dist)
-		for b := bpc - 1; b >= 0; b-- {
-			bits = append(bits, (idx>>b)&1 == 1)
-		}
-	}
-
-	// ── 5. bits → bytes, compute per-byte confidence ──────────────────────
-	rawBytes := bitsToBytes(bits)
-	cellsPerByte := 8 / bpc
-	byteConf := make([]float64, len(rawBytes))
-	for i := range rawBytes {
-		// Confidence for byte i = max cell distance across its contributing cells.
-		for k := 0; k < cellsPerByte; k++ {
-			ci := i*cellsPerByte + k
-			if ci < len(cellDist) && cellDist[ci] > byteConf[i] {
-				byteConf[i] = cellDist[ci]
-			}
-		}
-	}
-
-	// ── 6. RS decode ──────────────────────────────────────────────────────
-	byteData, err := rsDecode(rawBytes, byteConf)
-	if err != nil {
-		return nil, fmt.Errorf("rs decode: %w", err)
-	}
-
-	// ── 7. strip length header ────────────────────────────────────────────
-	if len(byteData) < 4 {
-		return nil, fmt.Errorf("data region too short to contain length header")
-	}
-	payloadLen := binary.BigEndian.Uint32(byteData[:4])
-	if int(payloadLen) > len(byteData)-4 {
-		return nil, fmt.Errorf("declared length %d exceeds available data %d",
-			payloadLen, len(byteData)-4)
-	}
-	return byteData[4 : 4+payloadLen], nil
+	return DecodeImage(img, opts)
 }
 
-// ── grid location ────────────────────────────────────────────────────────────
+// DecodeImage locates and decodes a symbol in img. The symbol may be scaled
+// and rotated; the module grid is derived from the three finder patterns by
+// an affine transform, so strong perspective distortion is not handled.
+func DecodeImage(img image.Image, opts *DecodeOptions) (*Result, error) {
+	var o DecodeOptions
+	if opts != nil {
+		o = *opts
+	}
+	p := newPixels(img)
+	triples := p.findFinderTriples()
+	if len(triples) == 0 {
+		return nil, errors.New("no finder patterns found")
+	}
+	var lastErr error
+	for _, t := range triples[:min(3, len(triples))] {
+		res, err := p.decodeAt(t, o)
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
 
-// locateGrid scans the image for the three finder patterns and derives
-// cellPx, the pixel offset of the inner grid origin, and the grid side.
-//
-// Strategy (perfect-alignment assumption):
-//  1. Find the top-left corner of the top-left finder pattern by scanning
-//     for a long run of dark pixels.
-//  2. Measure cellPx from the run length (7 cells wide).
-//  3. Derive innerOrigin and side from the image dimensions.
-func locateGrid(img image.Image) (cellPx, originX, originY, side int, err error) {
+// ── pixel access ────────────────────────────────────────────────────────────
+
+type pixels struct {
+	w, h      int
+	rgb       []float64 // 3 per pixel
+	dark      []bool
+	threshold float64
+}
+
+func newPixels(img image.Image) *pixels {
 	b := img.Bounds()
-	imgW, imgH := b.Max.X-b.Min.X, b.Max.Y-b.Min.Y
-
-	// Find the first dark pixel row by row.
-	var firstDarkX, firstDarkY int
-	found := false
-	for y := b.Min.Y; y < b.Max.Y && !found; y++ {
-		for x := b.Min.X; x < b.Max.X; x++ {
-			if isDark(img.At(x, y)) {
-				firstDarkX, firstDarkY = x, y
-				found = true
-				break
-			}
+	p := &pixels{w: b.Dx(), h: b.Dy()}
+	p.rgb = make([]float64, 3*p.w*p.h)
+	luma := make([]float64, p.w*p.h)
+	var hist [256]int
+	for y := 0; y < p.h; y++ {
+		for x := 0; x < p.w; x++ {
+			r, g, bl, a := img.At(b.Min.X+x, b.Min.Y+y).RGBA()
+			// Composite onto white so transparent areas count as quiet zone.
+			fr := (float64(r) + float64(0xffff-a)) / 257
+			fg := (float64(g) + float64(0xffff-a)) / 257
+			fb := (float64(bl) + float64(0xffff-a)) / 257
+			i := y*p.w + x
+			p.rgb[3*i], p.rgb[3*i+1], p.rgb[3*i+2] = fr, fg, fb
+			luma[i] = 0.299*fr + 0.587*fg + 0.114*fb
+			hist[min(255, int(luma[i]))]++
 		}
 	}
-	if !found {
-		return 0, 0, 0, 0, fmt.Errorf("no dark pixels found in image")
+	p.threshold = otsu(hist[:], p.w*p.h)
+	p.dark = make([]bool, p.w*p.h)
+	for i, l := range luma {
+		p.dark[i] = l < p.threshold
 	}
-
-	// Measure the horizontal run of dark pixels starting at firstDark.
-	// This run spans exactly 7 cells (the finder outer ring).
-	runLen := 0
-	for x := firstDarkX; x < b.Max.X && isDark(img.At(x, firstDarkY)); x++ {
-		runLen++
-	}
-	if runLen < finderSize {
-		return 0, 0, 0, 0, fmt.Errorf("finder run too short: %d px", runLen)
-	}
-	cellPx = runLen / finderSize
-
-	// The inner grid starts at firstDarkX, firstDarkY (quiet zone already
-	// accounted for by the dark pixel search).
-	originX = firstDarkX
-	originY = firstDarkY
-
-	// Inner grid side: the image covers (side + 2*quiet)*cellPx pixels.
-	// We know originX = quietZone*cellPx, so:
-	// side = (imgW - 2*quietZone*cellPx) / cellPx
-	side = (imgW - 2*originX) / cellPx
-	_ = imgH // symmetric
-
-	if side < 21 {
-		return 0, 0, 0, 0, fmt.Errorf("computed side %d is too small", side)
-	}
-	return cellPx, originX, originY, side, nil
+	return p
 }
 
-// ── palette sampling ─────────────────────────────────────────────────────────
-
-// samplePaletteFromStrips reads colors from the bottom palette strip and
-// clusters them to recover the reference palette via simple k-means.
-//
-// The strip repeats palette[i % nColors] for i = 0..side-1.  We average
-// samples of the same class to get robust centroid estimates.
-func samplePaletteFromStrips(img image.Image, ox, oy, side, cellPx int) Palette {
-	// Collect one sample per cell from the bottom-most palette row.
-	nColors := int(FourColor) // default; refined below
-	samples := make([]color.RGBA, side)
-	for c := 0; c < side; c++ {
-		cx := ox + c*cellPx + cellPx/2
-		cy := oy + (side-1)*cellPx + cellPx/2
-		samples[c] = sampleCell(img, cx, cy, cellPx)
+func otsu(hist []int, total int) float64 {
+	var sum float64
+	for i, n := range hist {
+		sum += float64(i * n)
 	}
-
-	// k-means with k=nColors, initialized by the first nColors samples.
-	centroids := make([]yuv, nColors)
-	for i := 0; i < nColors; i++ {
-		centroids[i] = rgbaToYUV(samples[i%len(samples)])
-	}
-
-	for iter := 0; iter < 20; iter++ {
-		sums := make([]yuv, nColors)
-		counts := make([]int, nColors)
-		for _, s := range samples {
-			sv := rgbaToYUV(s)
-			best, _ := nearestYUV(sv, centroids)
-			sums[best].Y += sv.Y
-			sums[best].U += sv.U
-			sums[best].V += sv.V
-			counts[best]++
+	var sumB, best float64
+	var wB int
+	th := 128.0
+	for i, n := range hist {
+		wB += n
+		if wB == 0 {
+			continue
 		}
-		moved := false
-		for k := range centroids {
-			if counts[k] == 0 {
-				continue
-			}
-			n := yuv{
-				Y: sums[k].Y / float64(counts[k]),
-				U: sums[k].U / float64(counts[k]),
-				V: sums[k].V / float64(counts[k]),
-			}
-			if n != centroids[k] {
-				moved = true
-				centroids[k] = n
-			}
-		}
-		if !moved {
+		wF := total - wB
+		if wF == 0 {
 			break
 		}
-	}
-
-	palette := make(Palette, nColors)
-	for i, c := range centroids {
-		palette[i] = yuvToRGBA(c)
-	}
-	return palette
-}
-
-// ── color classification ─────────────────────────────────────────────────────
-
-// nearestColor returns the index in palette that is closest to c in YUV space
-// (Euclidean distance), matching the minimum-distance classifier from the paper.
-func nearestColor(c color.RGBA, palette Palette) int {
-	idx, _ := nearestColorDist(c, palette)
-	return idx
-}
-
-// nearestColorDist returns the palette index and squared YUV distance.
-func nearestColorDist(c color.RGBA, palette Palette) (int, float64) {
-	cv := rgbaToYUV(c)
-	refs := make([]yuv, len(palette))
-	for i, p := range palette {
-		refs[i] = rgbaToYUV(p)
-	}
-	return nearestYUV(cv, refs)
-}
-
-func nearestYUV(c yuv, refs []yuv) (int, float64) {
-	best, bestDist := 0, math.MaxFloat64
-	for i, r := range refs {
-		d := yuvDist(c, r)
-		if d < bestDist {
-			best, bestDist = i, d
+		sumB += float64(i * n)
+		mB := sumB / float64(wB)
+		mF := (sum - sumB) / float64(wF)
+		if v := float64(wB) * float64(wF) * (mB - mF) * (mB - mF); v > best {
+			best, th = v, float64(i)+0.5
 		}
 	}
-	return best, bestDist
+	return th
 }
 
-func yuvDist(a, b yuv) float64 {
-	dy := a.Y - b.Y
-	du := a.U - b.U
-	dv := a.V - b.V
-	return dy*dy + du*du + dv*dv
+func (p *pixels) isDark(x, y int) bool {
+	if x < 0 || y < 0 || x >= p.w || y >= p.h {
+		return false
+	}
+	return p.dark[y*p.w+x]
 }
 
-// ── color space conversion ────────────────────────────────────────────────────
-
-// yuv holds floating-point YUV components.
-type yuv struct{ Y, U, V float64 }
-
-// rgbaToYUV converts an RGBA color to YUV (BT.601).
-func rgbaToYUV(c color.RGBA) yuv {
-	r := float64(c.R)
-	g := float64(c.G)
-	b := float64(c.B)
-	return yuv{
-		Y:  0.299*r + 0.587*g + 0.114*b,
-		U: -0.14713*r - 0.28886*g + 0.436*b,
-		V:  0.615*r - 0.51499*g - 0.10001*b,
-	}
-}
-
-// yuvToRGBA converts a YUV color back to RGBA (BT.601), clamping to [0,255].
-func yuvToRGBA(c yuv) color.RGBA {
-	r := c.Y + 1.13983*c.V
-	g := c.Y - 0.39465*c.U - 0.58060*c.V
-	b := c.Y + 2.03211*c.U
-	return color.RGBA{
-		R: clampU8(r),
-		G: clampU8(g),
-		B: clampU8(b),
-		A: 255,
-	}
-}
-
-func clampU8(v float64) uint8 {
-	if v < 0 {
-		return 0
-	}
-	if v > 255 {
-		return 255
-	}
-	return uint8(v)
-}
-
-// ── pixel helpers ─────────────────────────────────────────────────────────────
-
-// sampleCell returns the average RGBA of a cellPx×cellPx region centered at
-// (cx, cy).  Averaging over the full cell reduces noise from anti-aliasing or
-// scanner artifacts.
-func sampleCell(img image.Image, cx, cy, cellPx int) color.RGBA {
-	half := cellPx / 2
-	if half == 0 {
-		half = 1
-	}
-	var rSum, gSum, bSum, n int
-	for dy := -half / 2; dy <= half/2; dy++ {
-		for dx := -half / 2; dx <= half/2; dx++ {
-			c := img.At(cx+dx, cy+dy)
-			r, g, b, _ := c.RGBA()
-			rSum += int(r >> 8)
-			gSum += int(g >> 8)
-			bSum += int(b >> 8)
+// sample averages the pixels within radius r of (fx, fy).
+func (p *pixels) sample(fx, fy, r float64) (yuv, bool) {
+	var sr, sg, sb float64
+	n := 0
+	for y := int(math.Floor(fy - r)); y <= int(math.Ceil(fy+r)); y++ {
+		for x := int(math.Floor(fx - r)); x <= int(math.Ceil(fx+r)); x++ {
+			if x < 0 || y < 0 || x >= p.w || y >= p.h {
+				continue
+			}
+			dx, dy := float64(x)+0.5-fx, float64(y)+0.5-fy
+			if dx*dx+dy*dy > r*r+0.5 {
+				continue
+			}
+			i := 3 * (y*p.w + x)
+			sr += p.rgb[i]
+			sg += p.rgb[i+1]
+			sb += p.rgb[i+2]
 			n++
 		}
 	}
 	if n == 0 {
-		n = 1
+		return yuv{}, false
 	}
-	return color.RGBA{
-		R: uint8(rSum / n),
-		G: uint8(gSum / n),
-		B: uint8(bSum / n),
-		A: 255,
-	}
+	return toYUV(sr/float64(n), sg/float64(n), sb/float64(n)), true
 }
 
-// isDark returns true if the pixel's luma is below 128.
-func isDark(c color.Color) bool {
-	r, g, b, _ := c.RGBA()
-	y := (299*int(r>>8) + 587*int(g>>8) + 114*int(b>>8)) / 1000
-	return y < 128
+// ── finder pattern detection ────────────────────────────────────────────────
+
+type finder struct {
+	x, y   float64
+	module float64
+	count  int
 }
 
-// ── bit/byte helpers ──────────────────────────────────────────────────────────
+// ratioOK checks runs dark:light:dark:light:dark against 1:1:3:1:1.
+func ratioOK(r [5]int) (float64, bool) {
+	total := 0
+	for _, n := range r {
+		if n == 0 {
+			return 0, false
+		}
+		total += n
+	}
+	if total < 7 {
+		return 0, false
+	}
+	m := float64(total) / 7
+	v := m / 2
+	ok := math.Abs(m-float64(r[0])) < v && math.Abs(m-float64(r[1])) < v &&
+		math.Abs(3*m-float64(r[2])) < 3*v &&
+		math.Abs(m-float64(r[3])) < v && math.Abs(m-float64(r[4])) < v
+	return m, ok
+}
 
-func bitsToBytes(bits []bool) []byte {
-	nBytes := len(bits) / 8
-	bs := make([]byte, nBytes)
-	for i := 0; i < nBytes; i++ {
-		for j := 0; j < 8; j++ {
-			if bits[i*8+j] {
-				bs[i] |= 1 << (7 - j)
+// crossCheck walks from (x, y) along ±(dx, dy) and verifies a finder
+// pattern centered there. It returns the refined center offset (in steps
+// along the direction) and the module size in steps.
+func (p *pixels) crossCheck(x, y, dx, dy, maxRun int) (float64, float64, bool) {
+	if !p.isDark(x, y) {
+		return 0, 0, false
+	}
+	var r [5]int
+	// Backwards: rest of center, light, dark.
+	i := 0
+	for p.isDark(x-i*dx, y-i*dy) {
+		r[2]++
+		i++
+	}
+	for !p.isDark(x-i*dx, y-i*dy) && r[1] <= maxRun {
+		if !p.inBounds(x-i*dx, y-i*dy) {
+			return 0, 0, false
+		}
+		r[1]++
+		i++
+	}
+	for p.isDark(x-i*dx, y-i*dy) && r[0] <= maxRun {
+		r[0]++
+		i++
+	}
+	back := r[2]
+	// Forwards.
+	i = 1
+	for p.isDark(x+i*dx, y+i*dy) {
+		r[2]++
+		i++
+	}
+	fwd := r[2] - back
+	for !p.isDark(x+i*dx, y+i*dy) && r[3] <= maxRun {
+		if !p.inBounds(x+i*dx, y+i*dy) {
+			return 0, 0, false
+		}
+		r[3]++
+		i++
+	}
+	for p.isDark(x+i*dx, y+i*dy) && r[4] <= maxRun {
+		r[4]++
+		i++
+	}
+	m, ok := ratioOK(r)
+	if !ok {
+		return 0, 0, false
+	}
+	// Center of the middle run relative to (x, y).
+	return float64(fwd-back+1) / 2, m, true
+}
+
+func (p *pixels) inBounds(x, y int) bool { return x >= 0 && y >= 0 && x < p.w && y < p.h }
+
+func (p *pixels) findFinders() []finder {
+	var found []finder
+	add := func(f finder) {
+		for i := range found {
+			g := &found[i]
+			if math.Hypot(g.x-f.x, g.y-f.y) < 2*g.module && math.Abs(g.module-f.module) < 0.5*g.module+1 {
+				n := float64(g.count)
+				g.x = (g.x*n + f.x) / (n + 1)
+				g.y = (g.y*n + f.y) / (n + 1)
+				g.module = (g.module*n + f.module) / (n + 1)
+				g.count++
+				return
+			}
+		}
+		f.count = 1
+		found = append(found, f)
+	}
+
+	for y := 0; y < p.h; y++ {
+		// Run-length encode the row.
+		var starts, lens []int
+		var colors []bool
+		for x := 0; x < p.w; x++ {
+			d := p.isDark(x, y)
+			if len(colors) > 0 && colors[len(colors)-1] == d {
+				lens[len(lens)-1]++
+				continue
+			}
+			starts = append(starts, x)
+			lens = append(lens, 1)
+			colors = append(colors, d)
+		}
+		for i := 0; i+5 <= len(lens); i++ {
+			if !colors[i] {
+				continue
+			}
+			r := [5]int{lens[i], lens[i+1], lens[i+2], lens[i+3], lens[i+4]}
+			mh, ok := ratioOK(r)
+			if !ok {
+				continue
+			}
+			maxRun := int(4*mh) + 2
+			cx := starts[i+2] + lens[i+2]/2
+			offY, mv, ok := p.crossCheck(cx, y, 0, 1, maxRun)
+			if !ok || math.Abs(mv-mh) > 0.5*mh {
+				continue
+			}
+			cy := int(math.Round(float64(y) + offY))
+			offX, mh2, ok := p.crossCheck(cx, cy, 1, 0, maxRun)
+			if !ok {
+				continue
+			}
+			fx := float64(cx) + offX
+			if _, _, ok := p.crossCheck(int(math.Round(fx)), cy, 1, 1, maxRun); !ok {
+				continue
+			}
+			add(finder{x: fx + 0.5, y: float64(y) + offY + 0.5, module: (mv + mh2) / 2})
+		}
+	}
+	return found
+}
+
+type finderTriple struct {
+	tl, tr, bl finder
+	score      float64
+}
+
+// findFinderTriples returns plausible (top-left, top-right, bottom-left)
+// finder combinations, best first.
+func (p *pixels) findFinderTriples() []finderTriple {
+	fs := p.findFinders()
+	sort.Slice(fs, func(i, j int) bool { return fs[i].count > fs[j].count })
+	fs = fs[:min(len(fs), 12)]
+
+	var out []finderTriple
+	for i := range fs {
+		for j := i + 1; j < len(fs); j++ {
+			for k := j + 1; k < len(fs); k++ {
+				if t, ok := makeTriple(fs[i], fs[j], fs[k]); ok {
+					out = append(out, t)
+				}
 			}
 		}
 	}
-	return bs
+	sort.Slice(out, func(i, j int) bool { return out[i].score > out[j].score })
+	return out
+}
+
+func makeTriple(a, b, c finder) (finderTriple, bool) {
+	ms := []float64{a.module, b.module, c.module}
+	sort.Float64s(ms)
+	if ms[2] > 1.5*ms[0] {
+		return finderTriple{}, false
+	}
+	// The top-left finder is opposite the longest side.
+	dab, dbc, dca := dist(a, b), dist(b, c), dist(c, a)
+	tl, p, q := a, b, c
+	legA, legB, hyp := dab, dca, dbc
+	switch {
+	case dab >= dbc && dab >= dca:
+		tl, p, q = c, a, b
+		legA, legB, hyp = dbc, dca, dab
+	case dca >= dab && dca >= dbc:
+		tl, p, q = b, c, a
+		legA, legB, hyp = dab, dbc, dca
+	}
+	m := (ms[0] + ms[1] + ms[2]) / 3
+	if legA < 14*m || legB < 14*m { // side of at least 21 modules
+		return finderTriple{}, false
+	}
+	legErr := math.Abs(legA-legB) / math.Max(legA, legB)
+	hypErr := math.Abs(hyp*hyp-legA*legA-legB*legB) / (hyp * hyp)
+	if legErr > 0.2 || hypErr > 0.2 {
+		return finderTriple{}, false
+	}
+	// Orientation: in image coordinates (y down) the cross product of
+	// TR-TL and BL-TL is positive.
+	if (p.x-tl.x)*(q.y-tl.y)-(p.y-tl.y)*(q.x-tl.x) < 0 {
+		p, q = q, p
+	}
+	score := float64(a.count+b.count+c.count) * (1 - legErr - hypErr)
+	return finderTriple{tl: tl, tr: p, bl: q, score: score}, true
+}
+
+func dist(a, b finder) float64 { return math.Hypot(a.x-b.x, a.y-b.y) }
+
+// ── grid sampling ───────────────────────────────────────────────────────────
+
+type grid struct {
+	p              *pixels
+	side           int
+	ox, oy         float64 // pixel position of module coordinate (0, 0)
+	ux, uy, vx, vy float64 // pixel step per module along x and y
+	radius         float64
+}
+
+func newGrid(p *pixels, t finderTriple, side int) *grid {
+	n := float64(side - 7) // finder centers are side-7 modules apart
+	g := &grid{p: p, side: side}
+	g.ux, g.uy = (t.tr.x-t.tl.x)/n, (t.tr.y-t.tl.y)/n
+	g.vx, g.vy = (t.bl.x-t.tl.x)/n, (t.bl.y-t.tl.y)/n
+	g.ox = t.tl.x - 3.5*(g.ux+g.vx)
+	g.oy = t.tl.y - 3.5*(g.uy+g.vy)
+	g.radius = 0.3 * math.Min(math.Hypot(g.ux, g.uy), math.Hypot(g.vx, g.vy))
+	return g
+}
+
+func (g *grid) at(q point) yuv {
+	mx, my := float64(q.x)+0.5, float64(q.y)+0.5
+	c, _ := g.p.sample(g.ox+mx*g.ux+my*g.vx, g.oy+mx*g.uy+my*g.vy, g.radius)
+	return c
+}
+
+func (g *grid) dark(q point) bool { return g.at(q).Y < g.p.threshold }
+
+func (p *pixels) decodeAt(t finderTriple, o DecodeOptions) (*Result, error) {
+	m := (t.tl.module + t.tr.module + t.bl.module) / 3
+	est := ((dist(t.tl, t.tr)+dist(t.tl, t.bl))/2/m + 7 - 17) / 4
+	v0 := int(math.Round(est))
+
+	// The estimate drifts for large symbols, so try its neighbors too; the
+	// format, version information and RS checks reject wrong guesses.
+	candidates := []int{v0}
+	for d := 1; d <= 3; d++ {
+		candidates = append(candidates, v0+d, v0-d)
+	}
+	lastErr := errors.New("no plausible version")
+	for _, v := range candidates {
+		if v < MinVersion || v > MaxVersion {
+			continue
+		}
+		res, err := p.decodeVersion(t, v, o)
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func (p *pixels) decodeVersion(t finderTriple, v int, o DecodeOptions) (*Result, error) {
+	side := sideForVersion(v)
+	g := newGrid(p, t, side)
+
+	if v >= 7 {
+		best := 99
+		for _, pos := range versionPositions(side) {
+			var raw uint32
+			for i, q := range pos {
+				if g.dark(q) {
+					raw |= 1 << i
+				}
+			}
+			if dv, d := decodeVersion(raw); dv == v && d < best {
+				best = d
+			}
+		}
+		if best > 3 {
+			return nil, fmt.Errorf("version %d: version information mismatch", v)
+		}
+	}
+
+	var fi formatInfo
+	best := 99
+	for _, pos := range formatPositions(side) {
+		var raw uint32
+		for i, q := range pos {
+			if g.dark(q) {
+				raw |= 1 << i
+			}
+		}
+		if f, d := decodeFormat(raw); d < best {
+			fi, best = f, d
+		}
+	}
+	if best > 3 {
+		return nil, fmt.Errorf("version %d: unreadable format information", v)
+	}
+
+	l, err := newLayout(v, fi.scheme)
+	if err != nil {
+		return nil, err
+	}
+
+	// Learn the palette from the four palette patterns.
+	refs := make([]yuv, len(l.palette))
+	for i, pts := range l.palette {
+		for _, q := range pts {
+			c := g.at(q)
+			refs[i].Y += c.Y
+			refs[i].U += c.U
+			refs[i].V += c.V
+		}
+		n := float64(len(pts))
+		refs[i] = yuv{refs[i].Y / n, refs[i].U / n, refs[i].V / n}
+	}
+
+	samples := make([]yuv, len(l.data))
+	for i, q := range l.data {
+		samples[i] = g.at(q)
+	}
+	var labels []int
+	switch o.Classifier {
+	case MinDistance:
+		labels = classifyNearest(samples, refs)
+	default:
+		labels = classifyKMeans(samples, refs)
+	}
+
+	bpm := fi.scheme.BitsPerModule()
+	full := int(fi.scheme) - 1
+	var bw bitWriter
+	for i, q := range l.data {
+		val := labels[i]
+		if maskBit(fi.mask, q.x, q.y) {
+			val ^= full
+		}
+		bw.write(uint32(val), bpm)
+	}
+	cw := bw.bytes()[:l.codewords()]
+
+	blocks, err := newBlockLayout(len(cw), fi.level)
+	if err != nil {
+		return nil, err
+	}
+	data, corrected, err := blocks.deinterleave(cw)
+	if err != nil {
+		return nil, fmt.Errorf("version %d: %w", v, err)
+	}
+
+	br := bitReader{buf: data}
+	if mode := br.read(4); mode != modeByte {
+		return nil, fmt.Errorf("unsupported segment mode %04b", mode)
+	}
+	n := int(br.read(countBits))
+	if 4+countBits+8*n > 8*len(data) {
+		return nil, fmt.Errorf("declared length %d exceeds symbol capacity", n)
+	}
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = byte(br.read(8))
+	}
+	return &Result{
+		Data:      out,
+		Version:   v,
+		Scheme:    fi.scheme,
+		Level:     fi.level,
+		Mask:      fi.mask,
+		Corrected: corrected,
+	}, nil
+}
+
+// ── color classification ────────────────────────────────────────────────────
+
+func nearest(c yuv, refs []yuv) int {
+	best, bestD := 0, math.Inf(1)
+	for i, r := range refs {
+		if d := c.dist2(r); d < bestD {
+			best, bestD = i, d
+		}
+	}
+	return best
+}
+
+func classifyNearest(samples, refs []yuv) []int {
+	labels := make([]int, len(samples))
+	for i, s := range samples {
+		labels[i] = nearest(s, refs)
+	}
+	return labels
+}
+
+// classifyKMeans runs Lloyd's algorithm with k = palette size, starting from
+// the palette-pattern colors so that cluster i stays associated with
+// palette entry i.
+func classifyKMeans(samples, refs []yuv) []int {
+	cent := append([]yuv(nil), refs...)
+	labels := classifyNearest(samples, cent)
+	for range 30 {
+		sums := make([]yuv, len(cent))
+		counts := make([]int, len(cent))
+		for i, s := range samples {
+			k := labels[i]
+			sums[k].Y += s.Y
+			sums[k].U += s.U
+			sums[k].V += s.V
+			counts[k]++
+		}
+		for k := range cent {
+			if counts[k] > 0 {
+				n := float64(counts[k])
+				cent[k] = yuv{sums[k].Y / n, sums[k].U / n, sums[k].V / n}
+			}
+		}
+		next := classifyNearest(samples, cent)
+		changed := false
+		for i := range next {
+			if next[i] != labels[i] {
+				changed = true
+				break
+			}
+		}
+		labels = next
+		if !changed {
+			break
+		}
+	}
+	return labels
 }
