@@ -101,7 +101,8 @@ func Encode(w io.Writer, data []byte, opts *EncodeOptions) error {
 	return png.Encode(w, sym.Image(o.ModulePx, o.QuietZone))
 }
 
-// NewSymbol encodes data into the smallest symbol that fits.
+// NewSymbol encodes data into the smallest symbol that fits, starting at
+// opts.MinVersion.
 func NewSymbol(data []byte, opts *EncodeOptions) (*Symbol, error) {
 	var o EncodeOptions
 	if opts != nil {

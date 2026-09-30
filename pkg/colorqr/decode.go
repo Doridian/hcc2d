@@ -4,9 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"image"
-	_ "image/gif"  // register decoders for Decode
-	_ "image/jpeg" //
-	_ "image/png"  //
+	_ "image/gif" // register the GIF, JPEG and PNG decoders for Decode
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"math"
 	"sort"
@@ -454,23 +454,36 @@ func (p *pixels) decodeVersion(t finderTriple, v int, o DecodeOptions) (*Result,
 		}
 	}
 
-	var fi formatInfo
-	best := 99
-	for _, pos := range formatPositions(side) {
-		var raw uint32
+	var raws [2]uint32
+	for c, pos := range formatPositions(side) {
 		for i, q := range pos {
 			if g.dark(q) {
-				raw |= 1 << i
+				raws[c] |= 1 << i
 			}
 		}
-		if f, d := decodeFormat(raw); d < best {
-			fi, best = f, d
-		}
 	}
-	if best > 3 {
+	// Words of the same scheme are distance 7 apart, but 4- and 8-color
+	// words can be as close as 5, so with three bit errors the nearest word
+	// may have the wrong scheme. Try every word within distance 3, nearest
+	// first, and let Reed-Solomon reject the wrong ones.
+	candidates := formatCandidates(raws, 3)
+	if len(candidates) == 0 {
 		return nil, fmt.Errorf("version %d: unreadable format information", v)
 	}
+	var lastErr error
+	for _, fi := range candidates {
+		res, err := p.decodeFormatted(g, v, fi, o)
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
 
+// decodeFormatted reads the data region of a version v symbol whose format
+// information is fi.
+func (p *pixels) decodeFormatted(g *grid, v int, fi formatInfo, o DecodeOptions) (*Result, error) {
 	l, err := newLayout(v, fi.scheme)
 	if err != nil {
 		return nil, err

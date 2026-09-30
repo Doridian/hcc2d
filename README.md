@@ -52,13 +52,18 @@ all bits set is black. The 4-color assignment is the paper's example.
 You can pass a custom palette to the encoder. The decoder needs no settings
 for it, because it learns the colors from the palette patterns.
 
-### Where HCC2D departs from QR
+### Where this implementation departs from QR
+
+The paper does not specify these details, so this implementation makes the
+following choices.
 
 - **Color scheme signalling.** The format information is QR's
-  BCH(15,5) word. 4-color symbols use QR's mask `0x5412`; 8-color symbols use
-  `0x544D`. The two masks are at distance 5, the code's covering radius, so the
-  scheme is part of the protected format word and two bit errors are still
-  corrected.
+  BCH(15,5) word. 4-color symbols XOR it with QR's mask `0x5412`; 8-color
+  symbols use `0x544D`. Every 8-color format word is at least distance 5 (the
+  code's covering radius) from every 4-color one, so the scheme is part of the
+  protected format word and any two bit errors are still corrected. With
+  three errors the decoder tries every format word within distance 3 and
+  keeps the one whose data passes Reed-Solomon.
 - **Masking.** This uses the eight QR mask patterns. A masked module has its
   value complemented, so each color is swapped with its opposite: white↔black,
   cyan↔magenta. The QR penalty rules pick the mask. Rules 1 and 2 (runs and 2×2
@@ -137,7 +142,7 @@ colorqr decode -classifier euclidean -o out.bin data.png
 ## Library
 
 ```go
-import "git.foxden.network/FoxDen/colorqr/pkg/colorqr"
+import "git.foxden.network/FoxDen/hcc2d/pkg/colorqr"
 
 // Encode to PNG.
 err := colorqr.Encode(w, data, &colorqr.EncodeOptions{

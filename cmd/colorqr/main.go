@@ -15,7 +15,7 @@ import (
 	"io"
 	"os"
 
-	"git.foxden.network/FoxDen/colorqr/pkg/colorqr"
+	"git.foxden.network/FoxDen/hcc2d/pkg/colorqr"
 )
 
 func main() {
@@ -142,7 +142,7 @@ Usage:
 
 Encode flags:
   -o <file>        output PNG file (default out.png)
-  -colors <4|8>    color scheme: 4 colors = 2 bits/module, 8 colors = 3 bits/module
+  -colors <4|8>    4 colors = 2 bits/module, 8 colors = 3 bits/module (default 4)
   -ec <L|M|Q|H>    error correction level (default L)
   -version <n>     minimum symbol version 1-40 (default 1)
   -module <px>     pixels per module (default 8)
@@ -151,9 +151,9 @@ Encode flags:
   If <text> is omitted, the payload is read from stdin.
 
 Decode flags:
-  -o <file>                   write decoded bytes to file (default stdout)
+  -o <file>                       write decoded bytes to file (default stdout)
   -classifier <kmeans|euclidean>  color classifier (default kmeans)
-  -v                          print symbol information
+  -v                              print symbol information to stderr
 
 Examples:
   colorqr encode -o hello.png "Hello, world!"

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
+	"sort"
 )
 
 const (
@@ -75,9 +76,10 @@ var alignmentPositions = [MaxVersion + 1][]int{
 // QR format information is 5 data bits (EC level, mask) protected by a
 // BCH(15,5) code and XORed with 0x5412. HCC2D keeps it black and white; we
 // additionally signal the color scheme by using a different XOR mask for the
-// 8-color scheme. 0x544d lies at distance 5 (the code's covering radius) from
-// every 4-color format word, so the two sets stay separable with up to two
-// bit errors.
+// 8-color scheme. With 0x544d, every 8-color format word is at least distance
+// 5 (the code's covering radius) from every 4-color one, so the two sets stay
+// separable with up to two bit errors. With three, the decoder tries every
+// nearby word and lets Reed-Solomon pick (see formatCandidates).
 
 const (
 	formatMask4 = 0x5412
@@ -122,6 +124,34 @@ func decodeFormat(raw uint32) (formatInfo, int) {
 		}
 	}
 	return best, bestDist
+}
+
+// formatCandidates returns every format word within maxDist of either raw
+// copy, nearest first.
+func formatCandidates(raws [2]uint32, maxDist int) []formatInfo {
+	type cand struct {
+		f formatInfo
+		d int
+	}
+	var cs []cand
+	for _, s := range []Scheme{FourColor, EightColor} {
+		for l := ECLow; l <= ECHigh; l++ {
+			for mask := range 8 {
+				f := formatInfo{s, l, mask}
+				w := f.bits()
+				d := min(bits.OnesCount32(w^raws[0]), bits.OnesCount32(w^raws[1]))
+				if d <= maxDist {
+					cs = append(cs, cand{f, d})
+				}
+			}
+		}
+	}
+	sort.SliceStable(cs, func(i, j int) bool { return cs[i].d < cs[j].d })
+	out := make([]formatInfo, len(cs))
+	for i, c := range cs {
+		out[i] = c.f
+	}
+	return out
 }
 
 // ── version information (versions 7+) ──────────────────────────────────────

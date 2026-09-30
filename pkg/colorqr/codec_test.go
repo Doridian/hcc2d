@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"git.foxden.network/FoxDen/colorqr/pkg/colorqr"
+	"git.foxden.network/FoxDen/hcc2d/pkg/colorqr"
 )
 
 var schemes = []colorqr.Scheme{colorqr.FourColor, colorqr.EightColor}
@@ -102,8 +102,9 @@ func TestAllVersionsAndLevels(t *testing.T) {
 	}
 }
 
-// Capacity grows with the number of colors: a 4-color symbol must hold
-// roughly twice the payload of the equivalent QR symbol.
+// Capacity grows with the number of colors: a 4-color symbol must hold at
+// least 1.5× and an 8-color symbol at least 2.5× the payload of the
+// equivalent QR symbol (ideally 2× and 3×, minus the palette patterns).
 func TestCapacity(t *testing.T) {
 	for _, tc := range []struct {
 		v        int
@@ -153,8 +154,9 @@ func TestDamagedModulesAreCorrected(t *testing.T) {
 				sym := mustSymbol(t, data, &colorqr.EncodeOptions{Scheme: s, Level: level})
 				img := sym.Image(4, 4)
 				// Recolor random modules in the lower right quadrant (away
-				// from all finder, format and palette patterns): 3% at L,
-				// 15% at H.
+				// from all finder, format and palette patterns). The number
+				// of hits is 3% (L) or 15% (H) of the symbol's module count;
+				// some land on the same module or keep its color.
 				frac := map[colorqr.ECLevel]float64{colorqr.ECLow: 0.03, colorqr.ECHigh: 0.15}[level]
 				rng := rand.New(rand.NewPCG(7, uint64(s)))
 				pal := s.DefaultPalette()

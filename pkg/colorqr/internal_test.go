@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"math/bits"
 	"math/rand/v2"
+	"slices"
 	"testing"
 )
 
@@ -156,5 +157,36 @@ func TestInterleaveRoundTrip(t *testing.T) {
 		if err != nil || n != 0 || !bytes.Equal(got, data) {
 			t.Fatalf("total %d: round trip failed (corrected %d, err %v)", total, n, err)
 		}
+	}
+}
+
+// TestFormatCandidatesAcrossSchemes checks that a format word with three bit
+// errors keeps the true word among the candidates, even when a word of the
+// other scheme is nearer.
+func TestFormatCandidatesAcrossSchemes(t *testing.T) {
+	closer := 0
+	for _, s := range []Scheme{FourColor, EightColor} {
+		for l := ECLow; l <= ECHigh; l++ {
+			for m := range 8 {
+				f := formatInfo{s, l, m}
+				w := f.bits()
+				for i := range 15 {
+					for j := i + 1; j < 15; j++ {
+						for k := j + 1; k < 15; k++ {
+							raw := w ^ 1<<i ^ 1<<j ^ 1<<k
+							if near, _ := decodeFormat(raw); near.scheme != s {
+								closer++
+							}
+							if !slices.Contains(formatCandidates([2]uint32{raw, raw}, 3), f) {
+								t.Fatalf("%+v with errors at %d,%d,%d: not a candidate", f, i, j, k)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if closer == 0 {
+		t.Error("expected some three-error words to be nearer the other scheme")
 	}
 }

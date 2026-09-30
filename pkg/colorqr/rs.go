@@ -7,9 +7,9 @@ import "errors"
 // polynomial of an n-symbol code has the roots α^0 … α^(n-1), exactly as in
 // ISO/IEC 18004.
 //
-// Unlike an erasure code, this decoder locates errors itself
-// (Berlekamp-Massey + Chien search + Forney), so a block with n parity bytes
-// corrects up to n/2 misclassified bytes at unknown positions.
+// The decoder locates errors itself (Berlekamp-Massey + Chien search +
+// Forney) rather than relying on known erasure positions, so a block with n
+// parity bytes corrects up to n/2 misclassified bytes at unknown positions.
 
 var (
 	gfExp [512]byte
