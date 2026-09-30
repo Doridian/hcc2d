@@ -160,3 +160,7 @@ fmt.Println(res.Version, res.Scheme, res.Level, res.Corrected, string(res.Data))
 go test ./...          # full suite, including every version for both schemes
 go test -short ./...   # quicker subset
 ```
+
+## License
+
+Licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-or-later).
