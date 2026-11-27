@@ -102,19 +102,23 @@ func TestAllVersionsAndLevels(t *testing.T) {
 	}
 }
 
-// Capacity grows with the number of colors: a 4-color symbol must hold at
-// least 1.5× and an 8-color symbol at least 2.5× the payload of the
-// equivalent QR symbol (ideally 2× and 3×, minus the palette patterns).
+// HCC2D's code tables are QR's multiplied by the bits per module, so a
+// 4-color symbol holds exactly twice and an 8-color one three times QR's data
+// codewords; the byte-mode header is 4 mode bits and a 16-bit count.
 func TestCapacity(t *testing.T) {
 	for _, tc := range []struct {
-		v        int
-		qrLevelL int // QR byte-mode capacity at level L
-	}{{1, 17}, {10, 271}, {40, 2953}} {
-		c4 := colorqr.Capacity(tc.v, colorqr.FourColor, colorqr.ECLow)
-		c8 := colorqr.Capacity(tc.v, colorqr.EightColor, colorqr.ECLow)
-		t.Logf("v%d: QR-L %d bytes, 4-color %d bytes, 8-color %d bytes", tc.v, tc.qrLevelL, c4, c8)
-		if c4 < 3*tc.qrLevelL/2 || (tc.v > 1 && c8 < 5*tc.qrLevelL/2) {
-			t.Errorf("v%d: capacity too low", tc.v)
+		v      int
+		level  colorqr.ECLevel
+		qrData int // QR data codewords (ISO/IEC 18004 Table 7)
+	}{{1, colorqr.ECLow, 19}, {10, colorqr.ECLow, 274}, {10, colorqr.ECHigh, 122}, {40, colorqr.ECLow, 2956}, {40, colorqr.ECQuartile, 1666}} {
+		c4 := colorqr.Capacity(tc.v, colorqr.FourColor, tc.level)
+		c8 := colorqr.Capacity(tc.v, colorqr.EightColor, tc.level)
+		t.Logf("v%d-%s: QR %d data codewords, 4-color %d bytes, 8-color %d bytes", tc.v, tc.level, tc.qrData, c4, c8)
+		if want := (2*8*tc.qrData - 20) / 8; c4 != want {
+			t.Errorf("v%d-%s: 4-color capacity %d, want %d", tc.v, tc.level, c4, want)
+		}
+		if want := (3*8*tc.qrData - 20) / 8; tc.v > 1 && c8 != want {
+			t.Errorf("v%d-%s: 8-color capacity %d, want %d", tc.v, tc.level, c8, want)
 		}
 	}
 }

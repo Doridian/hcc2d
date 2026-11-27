@@ -2,9 +2,7 @@ package colorqr
 
 import (
 	"fmt"
-	"math"
 	"math/bits"
-	"sort"
 )
 
 const (
@@ -15,17 +13,17 @@ const (
 // sideForVersion returns the number of modules per side, as in QR.
 func sideForVersion(v int) int { return 17 + 4*v }
 
-// ECLevel is the error correction level. As in QR, it is stored in the
-// format information, but the RS block layout is derived from the symbol's
-// actual codeword count (which grows with the number of colors) rather than
-// from the QR tables.
+// ECLevel is the error correction level, stored in the format information
+// exactly as in QR. HCC2D keeps QR's Reed-Solomon block structure: every QR
+// block is repeated once per bit a module carries (see newBlockLayout), so
+// each level corrects the same share of byte errors as in QR.
 type ECLevel int
 
 const (
-	ECLow      ECLevel = iota // ~20% of codewords are parity; corrects ~10% byte errors
-	ECMedium                  // ~38%; corrects ~19%
-	ECQuartile                // ~55%; corrects ~27%
-	ECHigh                    // ~65%; corrects ~32%
+	ECLow      ECLevel = iota // ~20% of codewords are parity (QR level L)
+	ECMedium                  // ~38% (QR level M)
+	ECQuartile                // ~55% (QR level Q)
+	ECHigh                    // ~65% (QR level H)
 )
 
 func (l ECLevel) valid() bool { return l >= ECLow && l <= ECHigh }
@@ -52,11 +50,6 @@ func ParseECLevel(s string) (ECLevel, error) {
 	return 0, fmt.Errorf("unknown error correction level %q (want L, M, Q or H)", s)
 }
 
-// parityRatio mirrors the share of EC codewords QR spends at each level.
-func (l ECLevel) parityRatio() float64 {
-	return [...]float64{0.20, 0.38, 0.55, 0.65}[l]
-}
-
 // formatBits is the 2-bit EC indicator used in QR format information.
 func (l ECLevel) formatBits() uint32 { return [...]uint32{1, 0, 3, 2}[l] }
 
@@ -73,18 +66,12 @@ var alignmentPositions = [MaxVersion + 1][]int{
 
 // ── format information ──────────────────────────────────────────────────────
 //
-// QR format information is 5 data bits (EC level, mask) protected by a
-// BCH(15,5) code and XORed with 0x5412. HCC2D keeps it black and white; we
-// additionally signal the color scheme by using a different XOR mask for the
-// 8-color scheme. With 0x544d, every 8-color format word is at least distance
-// 5 (the code's covering radius) from every 4-color one, so the two sets stay
-// separable with up to two bit errors. With three, the decoder tries every
-// nearby word and lets Reed-Solomon pick (see formatCandidates).
+// HCC2D keeps QR's black-and-white format information unchanged: 5 data
+// bits (EC level, mask) protected by a BCH(15,5) code and XORed with
+// 0x5412. The color scheme is not part of it; the decoder recognizes it from
+// the period of the Color Palette Patterns.
 
-const (
-	formatMask4 = 0x5412
-	formatMask8 = 0x544d
-)
+const formatMask = 0x5412
 
 func bchFormat(data uint32) uint32 {
 	rem := data
@@ -95,28 +82,24 @@ func bchFormat(data uint32) uint32 {
 }
 
 type formatInfo struct {
-	scheme Scheme
-	level  ECLevel
-	mask   int
+	level ECLevel
+	mask  int
 }
 
 func (f formatInfo) bits() uint32 {
-	m := uint32(formatMask4)
-	if f.scheme == EightColor {
-		m = formatMask8
-	}
-	return bchFormat(f.level.formatBits()<<3|uint32(f.mask)) ^ m
+	return bchFormat(f.level.formatBits()<<3|uint32(f.mask)) ^ formatMask
 }
 
-// decodeFormat returns the format word nearest to raw and its Hamming
-// distance.
-func decodeFormat(raw uint32) (formatInfo, int) {
+// decodeFormat returns the format word nearest to either raw copy and its
+// Hamming distance. Format words are at least 7 apart, so up to three bit
+// errors are corrected.
+func decodeFormat(raws ...uint32) (formatInfo, int) {
 	var best formatInfo
 	bestDist := 99
-	for _, s := range []Scheme{FourColor, EightColor} {
-		for l := ECLow; l <= ECHigh; l++ {
-			for mask := range 8 {
-				f := formatInfo{s, l, mask}
+	for l := ECLow; l <= ECHigh; l++ {
+		for mask := range 8 {
+			f := formatInfo{l, mask}
+			for _, raw := range raws {
 				if d := bits.OnesCount32(f.bits() ^ raw); d < bestDist {
 					best, bestDist = f, d
 				}
@@ -124,34 +107,6 @@ func decodeFormat(raw uint32) (formatInfo, int) {
 		}
 	}
 	return best, bestDist
-}
-
-// formatCandidates returns every format word within maxDist of either raw
-// copy, nearest first.
-func formatCandidates(raws [2]uint32, maxDist int) []formatInfo {
-	type cand struct {
-		f formatInfo
-		d int
-	}
-	var cs []cand
-	for _, s := range []Scheme{FourColor, EightColor} {
-		for l := ECLow; l <= ECHigh; l++ {
-			for mask := range 8 {
-				f := formatInfo{s, l, mask}
-				w := f.bits()
-				d := min(bits.OnesCount32(w^raws[0]), bits.OnesCount32(w^raws[1]))
-				if d <= maxDist {
-					cs = append(cs, cand{f, d})
-				}
-			}
-		}
-	}
-	sort.SliceStable(cs, func(i, j int) bool { return cs[i].d < cs[j].d })
-	out := make([]formatInfo, len(cs))
-	for i, c := range cs {
-		out[i] = c.f
-	}
-	return out
 }
 
 // ── version information (versions 7+) ──────────────────────────────────────
@@ -177,66 +132,61 @@ func decodeVersion(raw uint32) (int, int) {
 // ── codeword layout ─────────────────────────────────────────────────────────
 
 // blockLayout describes how a symbol's codewords are split into
-// Reed-Solomon blocks. Blocks are at most 255 bytes (the RS limit for
-// GF(256)); the first numShort blocks are one byte shorter than the rest,
-// and every block carries the same number of parity bytes, as in QR.
+// Reed-Solomon blocks. HCC2D derives its code tables from QR's by
+// multiplying the codeword counts by the bits per module (Grillo et al.,
+// "High Capacity Colored Two Dimensional Codes", IMCSIT 2010); this
+// implementation does that by repeating every QR block BpM times, which
+// keeps QR's block sizes, its parity share and its correction capability.
+// Short blocks come first and blocks are interleaved as in QR.
 type blockLayout struct {
-	total     int // total codewords in the symbol
-	numBlocks int
-	numShort  int
-	shortLen  int // length of a short block (data + parity)
-	parity    int // parity bytes per block
+	dataLen []int // data codewords per block
+	parity  int   // parity codewords per block (the same for every block)
 }
 
-func newBlockLayout(total int, level ECLevel) (blockLayout, error) {
-	if total < 4 {
-		return blockLayout{}, fmt.Errorf("symbol too small: %d codewords", total)
+func newBlockLayout(version int, level ECLevel, s Scheme) blockLayout {
+	var b blockLayout
+	for _, g := range qrBlocks[version][level] {
+		b.parity = g.total - g.data
+		for range g.count * s.BitsPerModule() {
+			b.dataLen = append(b.dataLen, g.data)
+		}
 	}
-	nb := (total + 254) / 255
-	b := blockLayout{
-		total:     total,
-		numBlocks: nb,
-		shortLen:  total / nb,
-		numShort:  nb - total%nb,
-	}
-	b.parity = int(math.Round(float64(b.shortLen) * level.parityRatio()))
-	b.parity = max(b.parity, 2)
-	b.parity = min(b.parity, b.shortLen-1)
-	return b, nil
+	return b
 }
 
-func (b blockLayout) blockLen(i int) int {
-	if i < b.numShort {
-		return b.shortLen
+func (b blockLayout) dataCapacity() int {
+	n := 0
+	for _, d := range b.dataLen {
+		n += d
 	}
-	return b.shortLen + 1
+	return n
 }
 
-func (b blockLayout) dataCapacity() int { return b.total - b.numBlocks*b.parity }
+func (b blockLayout) total() int { return b.dataCapacity() + len(b.dataLen)*b.parity }
 
 // interleave splits data into blocks, computes parity for each, and
 // interleaves them as ISO/IEC 18004 does: first byte of every block, then
 // the second, …, followed by the parity bytes in the same fashion. A damaged
 // area of the symbol is thereby spread across all blocks.
 func (b blockLayout) interleave(data []byte) []byte {
-	dataBlocks := make([][]byte, b.numBlocks)
-	parity := make([][]byte, b.numBlocks)
-	off := 0
-	for i := range dataBlocks {
-		n := b.blockLen(i) - b.parity
+	dataBlocks := make([][]byte, len(b.dataLen))
+	parity := make([][]byte, len(b.dataLen))
+	off, maxLen := 0, 0
+	for i, n := range b.dataLen {
 		dataBlocks[i] = data[off : off+n]
 		parity[i] = rsEncode(dataBlocks[i], b.parity)
 		off += n
+		maxLen = max(maxLen, n)
 	}
-	out := make([]byte, 0, b.total)
-	for i := 0; i <= b.shortLen-b.parity; i++ {
+	out := make([]byte, 0, b.total())
+	for i := range maxLen {
 		for _, d := range dataBlocks {
 			if i < len(d) {
 				out = append(out, d[i])
 			}
 		}
 	}
-	for i := 0; i < b.parity; i++ {
+	for i := range b.parity {
 		for _, p := range parity {
 			out = append(out, p[i])
 		}
@@ -247,22 +197,24 @@ func (b blockLayout) interleave(data []byte) []byte {
 // deinterleave reverses interleave and error-corrects every block. It
 // returns the data bytes and the number of corrected bytes.
 func (b blockLayout) deinterleave(cw []byte) ([]byte, int, error) {
-	blocks := make([][]byte, b.numBlocks)
-	for i := range blocks {
-		blocks[i] = make([]byte, b.blockLen(i))
+	blocks := make([][]byte, len(b.dataLen))
+	maxLen := 0
+	for i, n := range b.dataLen {
+		blocks[i] = make([]byte, n+b.parity)
+		maxLen = max(maxLen, n)
 	}
 	idx := 0
-	for i := 0; i <= b.shortLen-b.parity; i++ {
-		for _, blk := range blocks {
-			if i < len(blk)-b.parity {
+	for i := range maxLen {
+		for j, blk := range blocks {
+			if i < b.dataLen[j] {
 				blk[i] = cw[idx]
 				idx++
 			}
 		}
 	}
-	for i := 0; i < b.parity; i++ {
-		for _, blk := range blocks {
-			blk[len(blk)-b.parity+i] = cw[idx]
+	for i := range b.parity {
+		for j, blk := range blocks {
+			blk[b.dataLen[j]+i] = cw[idx]
 			idx++
 		}
 	}
@@ -271,10 +223,10 @@ func (b blockLayout) deinterleave(cw []byte) ([]byte, int, error) {
 	for i, blk := range blocks {
 		n, err := rsDecode(blk, b.parity)
 		if err != nil {
-			return nil, 0, fmt.Errorf("block %d/%d: %w", i+1, b.numBlocks, err)
+			return nil, 0, fmt.Errorf("block %d/%d: %w", i+1, len(blocks), err)
 		}
 		corrected += n
-		data = append(data, blk[:len(blk)-b.parity]...)
+		data = append(data, blk[:b.dataLen[i]]...)
 	}
 	return data, corrected, nil
 }

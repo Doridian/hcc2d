@@ -6,6 +6,7 @@ import (
 	"image/color"
 	"image/png"
 	"io"
+	"sort"
 )
 
 const (
@@ -13,10 +14,10 @@ const (
 	DefaultModulePx = 8
 	// DefaultQuietZone is the default margin in modules, as in QR.
 	DefaultQuietZone = 4
-
-	modeByte  = 0b0100 // QR byte-mode indicator
-	countBits = 16     // character count width (colors raise capacity past QR's 8-bit V1-9 limit)
 )
+
+// maxPayload is the largest byte-mode payload (16-bit character count).
+const maxPayload = 1<<16 - 1
 
 // EncodeOptions controls symbol construction. The zero value produces a
 // 4-color symbol at EC level L in the smallest version that fits.
@@ -29,8 +30,11 @@ type EncodeOptions struct {
 	// decoder setting is needed.
 	Palette Palette
 
-	ModulePx  int // pixels per module for Encode (default DefaultModulePx)
-	QuietZone int // margin in modules for Encode (default DefaultQuietZone)
+	ModulePx int // pixels per module for Encode (default DefaultModulePx)
+	// QuietZone is the margin in modules for Encode, counted from the edge
+	// of the QR grid (default DefaultQuietZone). The innermost ring holds
+	// the palette patterns, so at least 2 is used.
+	QuietZone int
 }
 
 // Symbol is an encoded HCC2D symbol.
@@ -39,18 +43,32 @@ type Symbol struct {
 	Scheme  Scheme
 	Level   ECLevel
 	Mask    int
+	Mode    Mode // data segment mode
 
 	layout  *layout
 	palette Palette
-	dark    [][]bool // function modules
-	value   [][]int  // palette index of data and palette modules
+	dark    [][]bool      // function modules
+	value   [][]int       // palette index of data modules, -1 elsewhere
+	ring    map[point]int // palette pattern cells outside the QR grid
 }
 
-// Size returns the number of modules per side.
+// Size returns the number of modules per side of the QR grid. The palette
+// patterns lie one module outside it, at coordinates -1 and Size().
 func (s *Symbol) Size() int { return s.layout.side }
 
-// At returns the color of module (x, y).
+// Palette returns the symbol's colors; module value i has color i.
+func (s *Symbol) Palette() Palette { return s.palette }
+
+// At returns the color of module (x, y) for -1 <= x, y <= Size(). Cells of
+// the outer ring that are not part of a palette pattern are white.
 func (s *Symbol) At(x, y int) color.RGBA {
+	n := s.Size()
+	if x < 0 || y < 0 || x >= n || y >= n {
+		if v, ok := s.ring[point{x, y}]; ok {
+			return s.palette[v]
+		}
+		return colorWhite
+	}
 	if s.value[y][x] < 0 {
 		if s.dark[y][x] {
 			return colorBlack
@@ -61,16 +79,22 @@ func (s *Symbol) At(x, y int) color.RGBA {
 }
 
 // Image renders the symbol with modulePx pixels per module and a quietZone
-// module margin.
+// module margin around the QR grid (at least 2, since the innermost ring
+// holds the palette patterns).
 func (s *Symbol) Image(modulePx, quietZone int) *image.RGBA {
+	modulePx = max(1, modulePx)
+	quietZone = max(2, quietZone)
 	n := (s.Size() + 2*quietZone) * modulePx
 	img := image.NewRGBA(image.Rect(0, 0, n, n))
 	for i := range img.Pix {
 		img.Pix[i] = 255
 	}
-	for y := range s.Size() {
-		for x := range s.Size() {
+	for y := -1; y <= s.Size(); y++ {
+		for x := -1; x <= s.Size(); x++ {
 			c := s.At(x, y)
+			if c == colorWhite {
+				continue
+			}
 			x0, y0 := (x+quietZone)*modulePx, (y+quietZone)*modulePx
 			for py := y0; py < y0+modulePx; py++ {
 				for px := x0; px < x0+modulePx; px++ {
@@ -126,51 +150,59 @@ func NewSymbol(data []byte, opts *EncodeOptions) (*Symbol, error) {
 	if o.MinVersion == 0 {
 		o.MinVersion = MinVersion
 	}
-	if len(data) >= 1<<countBits {
-		return nil, fmt.Errorf("payload of %d bytes exceeds the maximum of %d", len(data), 1<<countBits-1)
+	if o.MinVersion < MinVersion || o.MinVersion > MaxVersion {
+		return nil, fmt.Errorf("minimum version %d out of range", o.MinVersion)
+	}
+	if len(data) > maxPayload {
+		return nil, fmt.Errorf("payload of %d bytes exceeds the maximum of %d", len(data), maxPayload)
 	}
 
-	needBits := 4 + countBits + 8*len(data)
+	mode := chooseMode(data)
 	for v := o.MinVersion; v <= MaxVersion; v++ {
 		l, err := newLayout(v, o.Scheme)
 		if err != nil {
 			continue // palette patterns do not fit yet
 		}
-		blocks, err := newBlockLayout(l.codewords(), o.Level)
-		if err != nil || blocks.dataCapacity()*8 < needBits {
+		blocks := newBlockLayout(v, o.Level, o.Scheme)
+		if len(data) > maxCount(mode, v, o.Scheme) || blocks.dataCapacity()*8 < segmentBits(mode, len(data), v, o.Scheme) {
 			continue
 		}
-		return buildSymbol(l, blocks, o, data), nil
+		return buildSymbol(l, blocks, o, mode, data), nil
 	}
 	return nil, fmt.Errorf("payload of %d bytes does not fit in a version %d %s symbol at EC level %s",
 		len(data), MaxVersion, o.Scheme, o.Level)
 }
 
-// Capacity returns the maximum payload in bytes of a symbol with the given
-// version, scheme and error correction level, or 0 if no such symbol exists.
+// Capacity returns the maximum byte-mode payload in bytes of a symbol with
+// the given version, scheme and error correction level, or 0 if no such
+// symbol exists.
 func Capacity(version int, s Scheme, level ECLevel) int {
+	return CapacityMode(version, s, level, ModeByte)
+}
+
+// CapacityMode is like Capacity for a payload of numeric or alphanumeric
+// characters (see Mode).
+func CapacityMode(version int, s Scheme, level ECLevel, m Mode) int {
 	if !s.valid() || !level.valid() {
 		return 0
 	}
-	l, err := newLayout(version, s)
-	if err != nil {
+	if _, err := newLayout(version, s); err != nil {
 		return 0
 	}
-	b, err := newBlockLayout(l.codewords(), level)
-	if err != nil {
-		return 0
+	bits := newBlockLayout(version, level, s).dataCapacity() * 8
+	n := 0
+	for step := maxPayload + 1; step > 0; step /= 2 {
+		if k := n + step; k <= maxCount(m, version, s) && segmentBits(m, k, version, s) <= bits {
+			n = k
+		}
 	}
-	return min(max(0, (b.dataCapacity()*8-4-countBits)/8), 1<<countBits-1)
+	return n
 }
 
-func buildSymbol(l *layout, blocks blockLayout, o EncodeOptions, data []byte) *Symbol {
-	// Byte-mode segment, terminator and QR pad bytes.
+func buildSymbol(l *layout, blocks blockLayout, o EncodeOptions, mode Mode, data []byte) *Symbol {
+	// One data segment, terminator and QR pad bytes.
 	var bw bitWriter
-	bw.write(modeByte, 4)
-	bw.write(uint32(len(data)), countBits)
-	for _, b := range data {
-		bw.write(uint32(b), 8)
-	}
+	writeSegment(&bw, mode, data, l.version, o.Scheme)
 	capBits := blocks.dataCapacity() * 8
 	bw.write(0, min(4, capBits-bw.n))
 	bw.write(0, (8-bw.n%8)%8)
@@ -179,6 +211,7 @@ func buildSymbol(l *layout, blocks blockLayout, o EncodeOptions, data []byte) *S
 	}
 
 	// Error correction, then split the codeword stream into module values.
+	// The remainder bits after the last codeword stay zero.
 	cw := blocks.interleave(bw.bytes())
 	bpm := o.Scheme.BitsPerModule()
 	br := bitReader{buf: cw}
@@ -191,10 +224,12 @@ func buildSymbol(l *layout, blocks blockLayout, o EncodeOptions, data []byte) *S
 		Version: l.version,
 		Scheme:  o.Scheme,
 		Level:   o.Level,
+		Mode:    mode,
 		layout:  l,
 		palette: o.Palette,
 		dark:    newBoolGrid(l.side),
 		value:   make([][]int, l.side),
+		ring:    map[point]int{},
 	}
 	for y := range sym.value {
 		sym.value[y] = make([]int, l.side)
@@ -205,7 +240,7 @@ func buildSymbol(l *layout, blocks blockLayout, o EncodeOptions, data []byte) *S
 	}
 	for i, pts := range l.palette {
 		for _, p := range pts {
-			sym.value[p.y][p.x] = i
+			sym.ring[p] = i
 		}
 	}
 
@@ -234,7 +269,7 @@ func (s *Symbol) applyMask(m int, values []int) {
 	}
 	s.Mask = m
 
-	fb := formatInfo{s.Scheme, s.Level, m}.bits()
+	fb := formatInfo{s.Level, m}.bits()
 	for _, copyPos := range formatPositions(l.side) {
 		for i, p := range copyPos {
 			s.dark[p.y][p.x] = fb>>i&1 == 1
@@ -250,46 +285,43 @@ func (s *Symbol) applyMask(m int, values []int) {
 	}
 }
 
-// penalty adapts the QR mask evaluation to color: rules 1 and 2 (runs and
-// 2×2 blocks) look at identical colors, while rules 3 and 4 (finder-like
-// patterns and dark/light balance) look at the symbol as a scanner's
-// black-and-white binarization sees it, since that is what finder
+// penalty scores mask m with the four QR rules. As in Grillo et al.
+// (IMCSIT 2010), the symbol is seen as a binary matrix of dark modules (the
+// darker half of the palette) and light ones, because that is what finder
 // detection works on.
 func (s *Symbol) penalty() int {
 	n := s.Size()
-	id := make([][]int, n)
 	dark := newBoolGrid(n)
+	darkValue := s.darkValues()
 	darkCount := 0
 	for y := range n {
-		id[y] = make([]int, n)
 		for x := range n {
-			c := s.At(x, y)
-			id[y][x] = int(c.R)<<16 | int(c.G)<<8 | int(c.B)
-			dark[y][x] = rgbaToYUV(c).Y < 128
+			if v := s.value[y][x]; v >= 0 {
+				dark[y][x] = darkValue[v]
+			} else {
+				dark[y][x] = s.dark[y][x]
+			}
 			if dark[y][x] {
 				darkCount++
 			}
 		}
 	}
-	at := func(x, y int, transpose bool) (int, bool) {
+	at := func(x, y int, transpose bool) bool {
 		if transpose {
-			x, y = y, x
+			return dark[x][y]
 		}
-		return id[y][x], dark[y][x]
+		return dark[y][x]
 	}
 
 	score := 0
 	for _, t := range []bool{false, true} {
 		for y := range n {
+			// Rule 1: runs of five or more modules of the same color.
 			run := 1
 			for x := 1; x <= n; x++ {
-				if x < n {
-					a, _ := at(x, y, t)
-					b, _ := at(x-1, y, t)
-					if a == b {
-						run++
-						continue
-					}
+				if x < n && at(x, y, t) == at(x-1, y, t) {
+					run++
+					continue
 				}
 				if run >= 5 {
 					score += 3 + run - 5
@@ -300,7 +332,7 @@ func (s *Symbol) penalty() int {
 			for x := 0; x+11 <= n; x++ {
 				var w uint
 				for k := range 11 {
-					if _, d := at(x+k, y, t); d {
+					if at(x+k, y, t) {
 						w |= 1 << (10 - k)
 					}
 				}
@@ -310,17 +342,35 @@ func (s *Symbol) penalty() int {
 			}
 		}
 	}
+	// Rule 2: 2×2 blocks of the same color.
 	for y := 0; y+1 < n; y++ {
 		for x := 0; x+1 < n; x++ {
-			c := id[y][x]
-			if id[y][x+1] == c && id[y+1][x] == c && id[y+1][x+1] == c {
+			c := dark[y][x]
+			if dark[y][x+1] == c && dark[y+1][x] == c && dark[y+1][x+1] == c {
 				score += 3
 			}
 		}
 	}
+	// Rule 4: balance of dark and light modules.
 	pct := darkCount * 100 / (n * n)
 	score += abs(pct-50) / 5 * 10
 	return score
+}
+
+// darkValues reports which palette entries are in the darker half by luma.
+func (s *Symbol) darkValues() []bool {
+	idx := make([]int, len(s.palette))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool {
+		return rgbaToYUV(s.palette[idx[a]]).Y < rgbaToYUV(s.palette[idx[b]]).Y
+	})
+	dark := make([]bool, len(s.palette))
+	for _, i := range idx[:len(idx)/2] {
+		dark[i] = true
+	}
+	return dark
 }
 
 type bitWriter struct {

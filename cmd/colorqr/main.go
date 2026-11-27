@@ -50,7 +50,7 @@ func encodeCmd(args []string) error {
 	ec := fs.String("ec", "L", "error correction level: L, M, Q or H")
 	version := fs.Int("version", 1, "minimum symbol version (1-40)")
 	modulePx := fs.Int("module", colorqr.DefaultModulePx, "pixels per module")
-	quiet := fs.Int("quiet", colorqr.DefaultQuietZone, "quiet zone in modules")
+	quiet := fs.Int("quiet", colorqr.DefaultQuietZone, "quiet zone in modules (at least 2: the palette patterns sit in the first ring)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -86,8 +86,8 @@ func encodeCmd(args []string) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "encoded %d bytes → %s (version %d, %d×%d modules, %s, EC %s, mask %d)\n",
-		len(data), *outFile, sym.Version, sym.Size(), sym.Size(), sym.Scheme, sym.Level, sym.Mask)
+	fmt.Fprintf(os.Stderr, "encoded %d bytes → %s (version %d, %d×%d modules, %s, EC %s, mask %d, %s mode)\n",
+		len(data), *outFile, sym.Version, sym.Size(), sym.Size(), sym.Scheme, sym.Level, sym.Mask, sym.Mode)
 	return nil
 }
 
@@ -146,7 +146,7 @@ Encode flags:
   -ec <L|M|Q|H>    error correction level (default L)
   -version <n>     minimum symbol version 1-40 (default 1)
   -module <px>     pixels per module (default 8)
-  -quiet <n>       quiet zone in modules (default 4)
+  -quiet <n>       quiet zone in modules, at least 2 (default 4)
 
   If <text> is omitted, the payload is read from stdin.
 

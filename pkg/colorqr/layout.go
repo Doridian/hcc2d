@@ -10,20 +10,31 @@ type point struct{ x, y int }
 //
 // HCC2D keeps every QR function pattern (finder patterns, separators, timing
 // patterns, alignment patterns, format and version information, dark module)
-// in black and white, and adds four Color Palette Patterns that the decoder
-// uses to learn how each color looks after printing and scanning. Each
-// palette pattern is a strip two modules thick in which module i shows
-// palette color i; the strips sit at the middle of the four edges, away
-// from the finder patterns and from each other.
+// in black and white and in its QR position, so the data modules are exactly
+// QR's. It adds four Color Palette Patterns that the decoder uses to learn
+// how each color looks after printing and scanning. As in Figure 3 of
+// Querini and Italiano (FedCSIS 2013), they are one module thick and lie in
+// the ring just outside the QR grid (rows -1 and side, columns -1 and side),
+// so together they take "only 2 rows and 2 columns". Each repeats the palette
+// (cell k shows color k mod n) for as many whole cycles as fit, starting next
+// to the separator of a finder pattern:
+//
+//   - top:    row -1, rightwards from column 8 (top-left finder)
+//   - left:   column -1, upwards from row side-9 (bottom-left finder)
+//   - bottom: row side, rightwards from column 8 (bottom-left finder)
+//   - right:  column side, downwards from row 8 (top-right finder)
+//
+// The top and left strips end at the separator of the opposite finder; the
+// bottom and right strips run to the far corner.
 type layout struct {
 	version int
 	side    int
 	scheme  Scheme
 
-	function [][]bool // true for every non-data module
-	fixed    [][]bool // dark modules of the static function patterns
-	palette  [][]point
-	data     []point // data modules in placement order
+	function [][]bool  // true for every non-data module
+	fixed    [][]bool  // dark modules of the static function patterns
+	palette  [][]point // palette pattern cells of each color, in the ring
+	data     []point   // data modules in placement order
 }
 
 func newLayout(version int, scheme Scheme) (*layout, error) {
@@ -92,29 +103,14 @@ func newLayout(version int, scheme Scheme) (*layout, error) {
 	}
 
 	// Color Palette Patterns.
-	n := int(scheme)
-	hi := side - 8 // first column of the top-right separator
-	if version >= 7 {
-		hi = side - 11 // first column of the top-right version block
-	}
-	if hi-9 < n {
+	strips := paletteStrips(side, int(scheme))
+	if len(strips[0]) == 0 {
 		return nil, fmt.Errorf("version %d is too small for the %s palette patterns", version, scheme)
 	}
-	c0 := 9 + (hi-9-n)/2
-	l.palette = make([][]point, n)
-	for i := range n {
-		c := c0 + i
-		for _, p := range []point{
-			{c, 0}, {c, 1}, // top
-			{c, side - 2}, {c, side - 1}, // bottom
-			{0, c}, {1, c}, // left
-			{side - 2, c}, {side - 1, c}, // right
-		} {
-			if l.function[p.y][p.x] {
-				return nil, fmt.Errorf("palette pattern collides with a function pattern at (%d,%d)", p.x, p.y)
-			}
-			l.function[p.y][p.x] = true
-			l.palette[i] = append(l.palette[i], p)
+	l.palette = make([][]point, int(scheme))
+	for _, strip := range strips {
+		for k, p := range strip {
+			l.palette[k%int(scheme)] = append(l.palette[k%int(scheme)], p)
 		}
 	}
 
@@ -141,14 +137,26 @@ func newLayout(version int, scheme Scheme) (*layout, error) {
 	return l, nil
 }
 
+// paletteStrips returns the cells of the four Color Palette Patterns of an
+// n-color symbol, in order (cell k shows color k mod n).
+func paletteStrips(side, n int) [4][]point {
+	short := (side - 16) / n * n // between two finders: columns 8 … side-9
+	long := (side - 8) / n * n   // from a finder to the far corner: 8 … side-1
+	var s [4][]point
+	for k := range short {
+		s[0] = append(s[0], point{8 + k, -1})        // top
+		s[1] = append(s[1], point{-1, side - 9 - k}) // left
+	}
+	for k := range long {
+		s[2] = append(s[2], point{8 + k, side}) // bottom
+		s[3] = append(s[3], point{side, 8 + k}) // right
+	}
+	return s
+}
+
 func (l *layout) setFunction(x, y int, dark bool) {
 	l.function[y][x] = true
 	l.fixed[y][x] = dark
-}
-
-// codewords is the number of whole bytes the data modules can hold.
-func (l *layout) codewords() int {
-	return len(l.data) * l.scheme.BitsPerModule() / 8
 }
 
 // formatPositions returns the two copies of the 15 format bits, bit i at
